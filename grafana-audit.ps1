@@ -7,25 +7,38 @@
   Prometheus alerts/rules (through datasource proxy), basic load metrics, and a small Loki sample.
 
 .PARAMETER Base
-  Base Grafana URL including subpath (/grafana). Adjust $Base in the param section for other deployments.
+  Base Grafana URL including subpath (/grafana).
 
 .PARAMETER Token
   Grafana service account or API key. Can also use GRAFANA_TOKEN env var.
 
 .NOTES
-Run with:  
-.\grafana-audit.ps1 -Base https://dev.edh-cde.unclass.dfo-mpo.gc.ca/grafana -Token <insert Grafana service account generated token that has admin privs> -LokiUID <the loki UID> 
-Get the service account token from the Grafana admin panel by creating a service account with admin privileges.
-Get the lokiUID: kubectl exec -n monitoring deploy/grafana -- curl -s -H "Authorization: Bearer <admin-token>" http://<host>/grafana/api/datasources | ConvertFrom-Json | Where-Object {$_.type -eq "loki"} | Select-Object name, uid, id
-#>
+ # Basic audit  
+.\grafana-audit.ps1 -Base $url -Token $token
+
+# Comprehensive security audit
+.\grafana-audit.ps1 -Base $url -Token $token -IncludeSecurityAudit -IncludeUserActivity
+
+# Performance analysis
+.\grafana-audit.ps1 -Base $url -Token $token -IncludePerformanceMetrics -ValidateAlerts
+
+# Full enterprise audit
+.\grafana-audit.ps1 -Base $url -Token $token -IncludeSecurityAudit -IncludePerformanceMetrics -IncludeUserActivity -ExportDashboards -ValidateAlerts
+  #>
 
 param(
-  [string]$Base = "https://dev.edh-cde.unclass.dfo-mpo.gc.ca/grafana",  #adjust as necessary, could be in the params but too much to type if you do this over and over again. 
-  [string]$Token = $env:GRAFANA_TOKEN,  
+  [string]$Base = ".....", #<the base url where grafana lives>
+  [string]$Token = $env:GRAFANA_TOKEN, 
   [string]$OutDir = "grafana-audit",
   [string]$PromUID = "promds",
-  [string]$LokiUID = $env:lokiUID, 
-  [int]$DashboardSample = 15
+  [string]$LokiUID = "lokids",
+  [string]$AzureMonitorUID = "azmonitor",
+  [int]$DashboardSample = 15,
+  [switch]$IncludeSecurityAudit,
+  [switch]$IncludePerformanceMetrics,
+  [switch]$IncludeUserActivity,
+  [switch]$ExportDashboards,
+  [switch]$ValidateAlerts
 )
 
 if (-not $Token) {
@@ -33,14 +46,17 @@ if (-not $Token) {
   exit 1
 }
 
-if (-not $ LokiUID) { 
-  Write-Error "No LokiUID provided (param -Token or env:LokiUID)."
-  exit 1
-}
-
 Write-Host "Using Grafana base: $Base"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $Headers = @{ Authorization = "Bearer $Token" }
+
+# Test connectivity first
+Write-Host "Testing Grafana connectivity..."
+if (-not (Test-GrafanaConnectivity -BaseUrl $Base -Headers $Headers)) {
+  Write-Error "Failed to connect to Grafana. Please check URL and token."
+  exit 1
+}
+Write-Host "✅ Grafana connectivity confirmed"
 
 function Save-Json {
   param(
@@ -80,6 +96,84 @@ function Invoke-PromQuery {
   return Invoke-GrafanaGet -Path $path
 }
 
+function Test-GrafanaConnectivity {
+  param([string]$BaseUrl, [hashtable]$Headers)
+  
+  try {
+    $response = Invoke-RestMethod -Uri "$BaseUrl/api/health" -Headers $Headers -Method Get -TimeoutSec 10
+    return $response.database -eq "ok"
+  } catch {
+    Write-Warning "Grafana connectivity test failed: $($_.Exception.Message)"
+    return $false
+  }
+}
+
+function Get-AlertSeverityBreakdown {
+  param($Alerts)
+  
+  $breakdown = @{
+    critical = 0
+    warning = 0
+    info = 0
+    unknown = 0
+  }
+  
+  if ($Alerts -and $Alerts.data -and $Alerts.data.alerts) {
+    foreach ($alert in $Alerts.data.alerts) {
+      $severity = $alert.labels.severity
+      if ($breakdown.ContainsKey($severity)) {
+        $breakdown[$severity]++
+      } else {
+        $breakdown.unknown++
+      }
+    }
+  }
+  
+  return $breakdown
+}
+
+function Export-AuditReport {
+  param(
+    [string]$OutputDir,
+    [object]$Summary
+  )
+  
+  $reportPath = Join-Path $OutputDir "AUDIT_REPORT.md"
+  $report = @"
+# Grafana Audit Report
+
+**Generated:** $($Summary.timestamp)
+**Grafana Version:** $($Summary.grafanaVersion)
+
+## Summary
+- **Datasources:** $($Summary.datasourceCount)
+- **Dashboards:** $($Summary.dashboardCount) 
+- **Folders:** $($Summary.folderCount)
+- **Active Alerts:** $($Summary.firingAlertsCount)/$($Summary.promAlertsCount)
+- **Users:** $($Summary.userCount)
+- **Teams:** $($Summary.teamCount)
+- **Plugins:** $($Summary.pluginCount)
+
+## Health Status
+- **Loki Connection:** $(if($Summary.lokiSampleSuccess) { "✅ OK" } else { "❌ Failed" })
+- **Azure Monitor:** $(if($Summary.azureMonitorConnected) { "✅ Connected" } else { "❌ Not Connected" })
+- **Version Status:** $(if($Summary.hasUpdate) { "⚠️ Update Available ($($Summary.latestVersion))" } else { "✅ Up to Date" })
+
+## Audit Scope
+$(if($Summary.auditFlags.securityAudit) { "✅ Security Audit" } else { "❌ Security Audit" })
+$(if($Summary.auditFlags.performanceMetrics) { "✅ Performance Metrics" } else { "❌ Performance Metrics" })
+$(if($Summary.auditFlags.userActivity) { "✅ User Activity" } else { "❌ User Activity" })
+$(if($Summary.auditFlags.dashboardExport) { "✅ Dashboard Export" } else { "❌ Dashboard Export" })
+$(if($Summary.auditFlags.alertValidation) { "✅ Alert Validation" } else { "❌ Alert Validation" })
+
+---
+*Run with additional flags for comprehensive analysis*
+"@
+  
+  $report | Out-File $reportPath -Encoding UTF8
+  Write-Host "Audit report saved: $reportPath"
+}
+
 # 1. Health & version
 $health   = Invoke-GrafanaGet "/api/health"
 $frontend = Invoke-GrafanaGet "/api/frontend/settings"
@@ -112,7 +206,7 @@ if ($dashIndex) {
   Save-Json "05_dashboards_index.json" $dashIndex
 }
 
-# 5. Dashboards
+# 5. Sample dashboards
 $sample = @()
 if ($dashIndex) {
   $dashIndex | Select-Object -First $DashboardSample | ForEach-Object {
@@ -195,18 +289,271 @@ if ($LokiUID) {
   Write-Host "No Loki UID provided; skipping Loki sample."
 }
 
-# 10. Summary
+# 10. Enhanced Security Audit (if requested)
+if ($IncludeSecurityAudit) {
+  Write-Host "Performing security audit..."
+  
+  # User and team information
+  $users = Invoke-GrafanaGet "/api/users/search"
+  $teams = Invoke-GrafanaGet "/api/teams/search"
+  $orgs = Invoke-GrafanaGet "/api/orgs"
+  
+  if ($users) { Save-Json "12_users_audit.json" $users }
+  if ($teams) { Save-Json "13_teams_audit.json" $teams }
+  if ($orgs) { Save-Json "14_orgs_audit.json" $orgs }
+  
+  # Service accounts and API keys
+  $serviceAccounts = Invoke-GrafanaGet "/api/serviceaccounts/search"
+  if ($serviceAccounts) { Save-Json "15_service_accounts.json" $serviceAccounts }
+  
+  # Authentication settings
+  $authSettings = Invoke-GrafanaGet "/api/admin/settings"
+  if ($authSettings) { 
+    # Redact sensitive auth info
+    if ($authSettings.auth) {
+      foreach ($provider in $authSettings.auth.PSObject.Properties) {
+        if ($provider.Value.client_secret) { $provider.Value.client_secret = "[REDACTED]" }
+        if ($provider.Value.client_id) { $provider.Value.client_id = "[REDACTED]" }
+      }
+    }
+    Save-Json "16_auth_settings.json" $authSettings
+  }
+}
+
+# 11. Performance Metrics Analysis (if requested)
+if ($IncludePerformanceMetrics) {
+  Write-Host "Collecting performance metrics..."
+  
+  # Extended Prometheus queries for performance analysis
+  $perfQueries = @{
+    queryDuration = 'histogram_quantile(0.99, sum(rate(grafana_http_request_duration_seconds_bucket[5m])) by (le))'
+    memoryUsage = 'process_resident_memory_bytes{job="grafana"}'
+    cpuUsage = 'rate(process_cpu_seconds_total{job="grafana"}[5m]) * 100'
+    dbConnections = 'grafana_database_connections_open'
+    apiRequestRate = 'sum(rate(grafana_http_request_total[5m])) by (code)'
+    alertEvaluationTime = 'histogram_quantile(0.95, sum(rate(grafana_alerting_rule_evaluation_duration_seconds_bucket[5m])) by (le))'
+    datasourceQueryDuration = 'histogram_quantile(0.95, sum(rate(grafana_datasource_request_duration_seconds_bucket[5m])) by (le, datasource))'
+  }
+  
+  $perfResults = @{}
+  foreach ($k in $perfQueries.Keys) {
+    $resp = Invoke-PromQuery -Query $perfQueries[$k]
+    if ($resp -and $resp.data) {
+      $perfResults[$k] = $resp.data.result
+    } else {
+      $perfResults[$k] = "ERROR"
+    }
+  }
+  Save-Json "17_performance_metrics.json" $perfResults
+}
+
+# 12. User Activity Analysis (if requested)
+if ($IncludeUserActivity) {
+  Write-Host "Analyzing user activity..."
+  
+  # Recent dashboard views and edits
+  $dashboardVersions = @()
+  if ($dashIndex) {
+    $dashIndex | Select-Object -First 10 | ForEach-Object {
+      $uid = $_.uid
+      $versions = Invoke-GrafanaGet "/api/dashboards/uid/$uid/versions"
+      if ($versions) {
+        $dashboardVersions += [pscustomobject]@{
+          uid = $uid
+          title = $_.title
+          versions = $versions
+        }
+      }
+    }
+  }
+  Save-Json "18_dashboard_activity.json" $dashboardVersions
+  
+  # Annotation activity
+  $annotations = Invoke-GrafanaGet "/api/annotations?limit=100"
+  if ($annotations) { Save-Json "19_recent_annotations.json" $annotations }
+}
+
+# 13. Dashboard Export (if requested)
+if ($ExportDashboards) {
+  Write-Host "Exporting dashboard definitions..."
+  $dashboardExports = @()
+  
+  if ($dashIndex) {
+    $dashIndex | Select-Object -First $DashboardSample | ForEach-Object {
+      $uid = $_.uid
+      $dash = Invoke-GrafanaGet "/api/dashboards/uid/$uid"
+      if ($dash -and $dash.dashboard) {
+        $dashboardExports += [pscustomobject]@{
+          uid = $uid
+          title = $dash.dashboard.title
+          dashboard = $dash.dashboard
+          meta = $dash.meta
+        }
+      }
+    }
+  }
+  Save-Json "20_dashboard_exports.json" $dashboardExports
+}
+
+# 14. Alert Validation (if requested)
+if ($ValidateAlerts) {
+  Write-Host "Validating alert configurations..."
+  
+  # Get all alert rules
+  $alertRules = Invoke-GrafanaGet "/api/ruler/grafana/api/v1/rules"
+  if ($alertRules) { Save-Json "21_alert_rules_detailed.json" $alertRules }
+  
+  # Get notification policies
+  $notificationPolicies = Invoke-GrafanaGet "/api/alertmanager/grafana/config/api/v1/receivers"
+  if ($notificationPolicies) { Save-Json "22_notification_policies.json" $notificationPolicies }
+  
+  # Test notification channels
+  $contactPoints = Invoke-GrafanaGet "/api/alertmanager/grafana/config/api/v1/alerts/groups"
+  if ($contactPoints) { Save-Json "23_alert_groups.json" $contactPoints }
+}
+
+# 15. Infrastructure Health Check
+Write-Host "Checking infrastructure health..."
+
+# Enhanced Prometheus cluster health
+$infraQueries = @{
+  prometheusUptime = 'up{job="prometheus-k8s"}'
+  grafanaUptime = 'up{job="grafana"}'
+  alertmanagerUptime = 'up{job="alertmanager-main"}'
+  nodeExporterUp = 'up{job="node-exporter"}'
+  kubeStateMetricsUp = 'up{job="kube-state-metrics"}'
+  prometheusTsdbSize = 'prometheus_tsdb_size_bytes'
+  prometheusRetention = 'prometheus_config_last_reload_success_timestamp_seconds'
+  diskSpaceUsage = 'node_filesystem_avail_bytes{mountpoint="/"}'
+}
+
+$infraResults = @{}
+foreach ($k in $infraQueries.Keys) {
+  $resp = Invoke-PromQuery -Query $infraQueries[$k]
+  if ($resp -and $resp.data) {
+    $infraResults[$k] = $resp.data.result
+  } else {
+    $infraResults[$k] = "ERROR"
+  }
+}
+Save-Json "24_infrastructure_health.json" $infraResults
+
+# 16. Azure Monitor Integration Check (if Azure Monitor datasource exists)
+if ($AzureMonitorUID -and ($datasources | Where-Object {$_.uid -eq $AzureMonitorUID})) {
+  Write-Host "Checking Azure Monitor integration..."
+  
+  # Test Azure Monitor connectivity
+  $azureQuery = "Heartbeat | summarize count() by bin(TimeGenerated, 1h) | order by TimeGenerated desc | limit 24"
+  $encodedQuery = [System.Uri]::EscapeDataString($azureQuery)
+  $azureResp = Invoke-GrafanaGet "/api/datasources/uid/$AzureMonitorUID/resources/azuremonitor/subscriptions/query?query=$encodedQuery"
+  
+  if ($azureResp) {
+    Save-Json "25_azure_monitor_sample.json" $azureResp
+  }
+}
+
+# 17. Plugin Analysis
+$plugins = Invoke-GrafanaGet "/api/plugins"
+if ($plugins) {
+  $pluginSummary = $plugins | ForEach-Object {
+    [pscustomobject]@{
+      id = $_.id
+      name = $_.name
+      type = $_.type
+      enabled = $_.enabled
+      version = $_.info.version
+      hasUpdate = $_.hasUpdate
+    }
+  }
+  Save-Json "26_plugins_analysis.json" $pluginSummary
+}
+
+# 18. Configuration Validation
+Write-Host "Validating configuration..."
+
+$configValidation = @{
+  datasourceConnectivity = @()
+  dashboardErrors = @()
+  alertRuleValidation = @()
+  securityIssues = @()
+}
+
+# Test datasource connectivity
+if ($datasources) {
+  foreach ($ds in $datasources) {
+    $testResult = Invoke-GrafanaGet "/api/datasources/uid/$($ds.uid)/health"
+    $configValidation.datasourceConnectivity += [pscustomobject]@{
+      name = $ds.name
+      type = $ds.type
+      uid = $ds.uid
+      status = if ($testResult) { "OK" } else { "ERROR" }
+      details = $testResult
+    }
+  }
+}
+
+# Check for common security issues
+if ($IncludeSecurityAudit) {
+  # Check for default passwords, open permissions, etc.
+  if ($authSettings -and $authSettings.security) {
+    if ($authSettings.security.admin_user -eq "admin") {
+      $configValidation.securityIssues += "Default admin username detected"
+    }
+    if ($authSettings.security.allow_sign_up -eq $true) {
+      $configValidation.securityIssues += "Public sign-up is enabled"
+    }
+  }
+}
+
+Save-Json "27_configuration_validation.json" $configValidation
+
+# 19. Enhanced Summary
 $summary = [pscustomobject]@{
   timestamp            = (Get-Date).ToString("o")
   grafanaVersion       = if ($frontend) { $frontend.buildInfo.version } else { "UNKNOWN" }
+  hasUpdate           = if ($frontend) { $frontend.buildInfo.hasUpdate } else { $false }
+  latestVersion       = if ($frontend) { $frontend.buildInfo.latestVersion } else { "UNKNOWN" }
   datasourceCount      = if ($datasources) { $datasources.Count } else { 0 }
   dashboardCount       = if ($dashIndex) { $dashIndex.Count } else { 0 }
   sampledDashboards    = $sample.Count
+  folderCount         = if ($folders) { $folders.Count } else { 0 }
   prometheusHeadSeries = ($loadResults.headSeries | ConvertTo-Json -Depth 3)
   promAlertsCount      = if ($promAlerts -and $promAlerts.data) { ($promAlerts.data.alerts | Measure-Object).Count } else { 0 }
+  firingAlertsCount   = if ($promAlerts -and $promAlerts.data) { ($promAlerts.data.alerts | Where-Object {$_.state -eq "firing"} | Measure-Object).Count } else { 0 }
   unifiedAlertsPresent = [bool]$unifiedAlerts
   lokiSampleSuccess    = $lokiOk
+  azureMonitorConnected = [bool]($datasources | Where-Object {$_.type -eq "grafana-azure-monitor-datasource"})
+  pluginCount         = if ($plugins) { $plugins.Count } else { 0 }
+  userCount           = if ($users) { $users.users.Count } else { 0 }
+  teamCount           = if ($teams) { $teams.totalCount } else { 0 }
+  auditFlags = @{
+    securityAudit = $IncludeSecurityAudit.IsPresent
+    performanceMetrics = $IncludePerformanceMetrics.IsPresent
+    userActivity = $IncludeUserActivity.IsPresent
+    dashboardExport = $ExportDashboards.IsPresent
+    alertValidation = $ValidateAlerts.IsPresent
+  }
 }
 Save-Json "00_summary.json" $summary
 
-Write-Host "`n--- Completed audit. Output folder: $OutDir ---"
+# Generate audit report
+Export-AuditReport -OutputDir $OutDir -Summary $summary
+
+# Alert severity breakdown
+if ($promAlerts) {
+  $alertBreakdown = Get-AlertSeverityBreakdown -Alerts $promAlerts
+  Save-Json "28_alert_severity_breakdown.json" $alertBreakdown
+}
+
+Write-Host "`n--- Completed enhanced audit. Output folder: $OutDir ---"
+Write-Host "Files generated: $(Get-ChildItem $OutDir -Filter '*.json' | Measure-Object | Select-Object -ExpandProperty Count)"
+Write-Host "Summary highlights:"
+Write-Host "  - Grafana version: $($summary.grafanaVersion) $(if($summary.hasUpdate) { "(Update available: $($summary.latestVersion))" } else { "(Up to date)" })"
+Write-Host "  - Datasources: $($summary.datasourceCount)"
+Write-Host "  - Dashboards: $($summary.dashboardCount)"
+Write-Host "  - Active alerts: $($summary.firingAlertsCount)/$($summary.promAlertsCount)"
+Write-Host "  - Plugins: $($summary.pluginCount)"
+
+if ($alertBreakdown) {
+  Write-Host "  - Alert breakdown: Critical($($alertBreakdown.critical)) Warning($($alertBreakdown.warning)) Info($($alertBreakdown.info))"
+}
