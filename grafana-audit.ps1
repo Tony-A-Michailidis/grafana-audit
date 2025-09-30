@@ -23,11 +23,11 @@
 .\grafana-audit.ps1 -Base $url -Token $token -IncludePerformanceMetrics -ValidateAlerts
 
 # Full enterprise audit
-.\grafana-audit.ps1 -Base $url -Token $token -IncludeSecurityAudit -IncludePerformanceMetrics -IncludeUserActivity -ExportDashboards -ValidateAlerts
+.\grafana-audit.ps1 -Base $base -Token $token -IncludeSecurityAudit -IncludePerformanceMetrics -IncludeUserActivity -ExportDashboards -ValidateAlerts
 #>
 
 param(
-  [string]$Base = "....", 
+  [string]$Base = $env:BASE, 
   [string]$Token = $env:GRAFANA_TOKEN,  
   [string]$OutDir = "grafana-audit",
   [string]$PromUID = "promds",
@@ -178,7 +178,9 @@ function Invoke-GrafanaGetWithFallback {
     [switch]$IsOptional
   )
   
-  $result = Invoke-GrafanaGet -Path $Path -SuppressWarnings:$IsOptional
+  # Always suppress warnings for admin-required endpoints
+  $suppressWarnings = $IsAdminRequired -or $IsOptional
+  $result = Invoke-GrafanaGet -Path $Path -SuppressWarnings:$suppressWarnings
   
   if (-not $result -and $IsAdminRequired) {
     Write-Host "⚠️  Skipping $Description (requires admin privileges)" -ForegroundColor Yellow
@@ -203,6 +205,7 @@ if (-not (Test-GrafanaConnectivity -BaseUrl $Base -Headers $Headers)) {
 Write-Host "✅ Grafana connectivity confirmed"
 
 # 1. Health & version
+Write-Host "📊 Collecting Grafana health and version info..."
 $health   = Invoke-GrafanaGet "/api/health"
 $frontend = Invoke-GrafanaGet "/api/frontend/settings"
 Save-Json "01_health.json" $health
@@ -211,6 +214,7 @@ if ($frontend -and $frontend.buildInfo) {
 }
 
 # 2. Datasources
+Write-Host "🔌 Analyzing datasources and connectivity..."
 $datasources = Invoke-GrafanaGet "/api/datasources"
 if ($datasources) {
   # Redact secure fields
@@ -229,6 +233,7 @@ if ($folders) {
 }
 
 # 4. Dashboard index
+Write-Host "📈 Collecting dashboard inventory..."
 $dashIndex = Invoke-GrafanaGet "/api/search?type=dash-db&limit=5000"
 if ($dashIndex) {
   Save-Json "05_dashboards_index.json" $dashIndex
@@ -260,6 +265,7 @@ if ($unifiedAlerts) {
 }
 
 # 7. Prometheus alerts & rules (through proxy)
+Write-Host "🚨 Collecting alert configurations..."
 $promAlerts = Invoke-GrafanaGet "/api/datasources/uid/$PromUID/resources/api/v1/alerts"
 if ($promAlerts) {
   Save-Json "08_prometheus_alerts.json" $promAlerts
@@ -329,12 +335,22 @@ if ($LokiUID) {
 
 # 10. Enhanced Security Audit (if requested)
 if ($IncludeSecurityAudit) {
-  Write-Host "Performing security audit..."
+  Write-Host "🔒 Performing security audit..."
   
   # User and team information (requires admin privileges)
   $users = Invoke-GrafanaGetWithFallback "/api/users/search" "User audit" -IsAdminRequired
   $teams = Invoke-GrafanaGet "/api/teams/search"
   $orgs = Invoke-GrafanaGetWithFallback "/api/orgs" "Organization audit" -IsAdminRequired
+  
+  # Try alternative endpoints for partial user info
+  if (-not $users) {
+    Write-Host "  📝 Trying alternative user info endpoints..."
+    $currentUser = Invoke-GrafanaGet "/api/user" -SuppressWarnings
+    if ($currentUser) {
+      Write-Host "  ✅ Current user info available"
+      Save-Json "12_current_user_info.json" $currentUser
+    }
+  }
   
   if ($users) { Save-Json "12_users_audit.json" $users }
   if ($teams) { Save-Json "13_teams_audit.json" $teams }
@@ -360,7 +376,7 @@ if ($IncludeSecurityAudit) {
 
 # 11. Performance Metrics Analysis (if requested)
 if ($IncludePerformanceMetrics) {
-  Write-Host "Collecting performance metrics..."
+  Write-Host "📊 Collecting performance metrics..."
   
   # Extended Prometheus queries for performance analysis
   $perfQueries = @{
@@ -387,7 +403,7 @@ if ($IncludePerformanceMetrics) {
 
 # 12. User Activity Analysis (if requested)
 if ($IncludeUserActivity) {
-  Write-Host "Analyzing user activity..."
+  Write-Host "👥 Analyzing user activity..."
   
   # Recent dashboard views and edits
   $dashboardVersions = @()
@@ -413,7 +429,7 @@ if ($IncludeUserActivity) {
 
 # 13. Dashboard Export (if requested)
 if ($ExportDashboards) {
-  Write-Host "Exporting dashboard definitions..."
+  Write-Host "💾 Exporting dashboard definitions..."
   $dashboardExports = @()
   
   if ($dashIndex) {
@@ -435,7 +451,7 @@ if ($ExportDashboards) {
 
 # 14. Alert Validation (if requested)
 if ($ValidateAlerts) {
-  Write-Host "Validating alert configurations..."
+  Write-Host "⚙️ Validating alert configurations..."
   
   # Get all alert rules
   $alertRules = Invoke-GrafanaGet "/api/ruler/grafana/api/v1/rules"
@@ -445,22 +461,38 @@ if ($ValidateAlerts) {
   $notificationPolicies = Invoke-GrafanaGet "/api/alertmanager/grafana/config/api/v1/receivers"
   if ($notificationPolicies) { Save-Json "22_notification_policies.json" $notificationPolicies }
   
-  # Test alert groups - try different endpoints
-  $alertGroups = Invoke-GrafanaGet "/api/alertmanager/grafana/api/v1/alerts/groups" -SuppressWarnings
-  if (-not $alertGroups) {
-    $alertGroups = Invoke-GrafanaGet "/api/alertmanager/grafana/api/v2/alerts/groups" -SuppressWarnings
+  # Test alert groups - try comprehensive endpoint list
+  $alertGroupsPaths = @(
+    "/api/alertmanager/grafana/api/v1/alerts/groups",
+    "/api/alertmanager/grafana/api/v2/alerts/groups", 
+    "/api/v1/alerts/groups",
+    "/api/alertmanager/api/v1/alerts/groups",
+    "/api/alertmanager/api/v2/alerts/groups"
+  )
+  
+  $alertGroups = $null
+  $alertGroupsPath = $null
+  
+  foreach ($path in $alertGroupsPaths) {
+    $testGroups = Invoke-GrafanaGet $path -SuppressWarnings
+    if ($testGroups) {
+      $alertGroups = $testGroups
+      $alertGroupsPath = $path
+      break
+    }
   }
   
   if ($alertGroups) { 
+    Write-Host "✅ Alert groups found via: $alertGroupsPath"
     Save-Json "23_alert_groups.json" $alertGroups 
   } else {
-    Write-Host "⚠️  Alert groups endpoint not available" -ForegroundColor Yellow
-    Save-Json "23_alert_groups.json" @{status="not_available";message="Alert groups endpoint not found"}
+    Write-Host "ℹ️  Alert groups not available (this is normal for some Grafana configurations)" -ForegroundColor Cyan
+    Save-Json "23_alert_groups.json" @{status="not_available";message="Alert groups endpoint not found - may not be configured"}
   }
 }
 
 # 15. Infrastructure Health Check
-Write-Host "Checking infrastructure health..."
+Write-Host "🏥 Checking infrastructure health..."
 
 # Enhanced Prometheus cluster health
 $infraQueries = @{
@@ -486,35 +518,85 @@ foreach ($k in $infraQueries.Keys) {
 Save-Json "24_infrastructure_health.json" $infraResults
 
 # 16. Azure Monitor Integration Check (if Azure Monitor datasource exists)
-if ($AzureMonitorUID -and ($datasources | Where-Object {$_.uid -eq $AzureMonitorUID})) {
-  Write-Host "Checking Azure Monitor integration..."
+$azureDS = $datasources | Where-Object {$_.type -eq "grafana-azure-monitor-datasource"} | Select-Object -First 1
+if ($azureDS) {
+  Write-Host "☁️ Checking Azure Monitor integration..."
   
-  # Test Azure Monitor connectivity with a simpler query
-  $azureQuery = "Heartbeat | limit 1"
-  $encodedQuery = [System.Uri]::EscapeDataString($azureQuery)
+  # First test datasource health
+  $azureHealth = Invoke-GrafanaGet "/api/datasources/uid/$($azureDS.uid)/health" -SuppressWarnings
   
-  # Try different Azure Monitor API paths
-  $azurePaths = @(
-    "/api/datasources/uid/$AzureMonitorUID/resources/azuremonitor/query?query=$encodedQuery",
-    "/api/datasources/uid/$AzureMonitorUID/resources/logs?query=$encodedQuery",
-    "/api/datasources/uid/$AzureMonitorUID/proxy/v1/workspaces/query?query=$encodedQuery"
-  )
-  
-  $azureSuccess = $false
-  foreach ($path in $azurePaths) {
-    $azureResp = Invoke-GrafanaGet $path -SuppressWarnings
-    if ($azureResp) {
-      Save-Json "25_azure_monitor_sample.json" $azureResp
-      $azureSuccess = $true
-      Write-Host "✅ Azure Monitor connection successful"
-      break
+  if ($azureHealth -and $azureHealth.status -eq "OK") {
+    Write-Host "✅ Azure Monitor datasource health: OK"
+    
+    # Show Azure Monitor configuration details
+    Write-Host "  📋 Azure Monitor Configuration:"
+    if ($azureDS.jsonData.subscriptionId) { Write-Host "    • Subscription: $($azureDS.jsonData.subscriptionId)" }
+    if ($azureDS.jsonData.tenantId) { Write-Host "    • Tenant: $($azureDS.jsonData.tenantId)" }
+    if ($azureDS.jsonData.clientId) { Write-Host "    • Client ID: $($azureDS.jsonData.clientId)" }
+    
+    # Try to get workspace info from datasource config
+    $workspaceId = $null
+    if ($azureDS.jsonData -and $azureDS.jsonData.logAnalyticsDefaultWorkspace) {
+      $workspaceResource = $azureDS.jsonData.logAnalyticsDefaultWorkspace
+      Write-Host "    • Workspace: $($workspaceResource -replace '.*/workspaces/', '')"
+      
+      # Test with a simple KQL query
+      $simpleQuery = "print 'test'"
+      $encodedQuery = [System.Uri]::EscapeDataString($simpleQuery)
+      
+      # Try different Azure Monitor API endpoints
+      $azurePaths = @(
+        "/api/datasources/uid/$($azureDS.uid)/resources/azuremonitor/v1/workspaces/$($workspaceResource -replace '.*/workspaces/', '')/query?query=$encodedQuery",
+        "/api/datasources/uid/$($azureDS.uid)/resources/logs/v1/workspaces/$($workspaceResource -replace '.*/workspaces/', '')/query?query=$encodedQuery",
+        "/api/datasources/uid/$($azureDS.uid)/proxy/v1/workspaces/$($workspaceResource -replace '.*/workspaces/', '')/query?query=$encodedQuery"
+      )
+      
+      $azureSuccess = $false
+      foreach ($path in $azurePaths) {
+        $azureResp = Invoke-GrafanaGet $path -SuppressWarnings
+        if ($azureResp) {
+          Save-Json "25_azure_monitor_sample.json" $azureResp
+          $azureSuccess = $true
+          Write-Host "✅ Azure Monitor query successful"
+          break
+        }
+      }
+      
+      if (-not $azureSuccess) {
+        Write-Host "⚠️  Azure Monitor datasource configured but queries not working" -ForegroundColor Yellow
+        Write-Host "    💡 Troubleshooting steps:"
+        Write-Host "      1. Check service principal permissions on workspace"
+        Write-Host "      2. Verify workspace is accessible from Grafana"
+        Write-Host "      3. Test authentication in Azure Monitor datasource settings"
+        Save-Json "25_azure_monitor_sample.json" @{
+          status="configured_but_no_query"
+          message="Datasource healthy but query endpoint not accessible"
+          workspace=$workspaceResource
+          troubleshooting=@(
+            "Check service principal has 'Log Analytics Reader' role on workspace",
+            "Verify workspace exists and is in correct subscription",
+            "Test datasource connection in Grafana UI",
+            "Check network connectivity to Azure Monitor APIs"
+          )
+        }
+      }
+    } else {
+      Write-Host "ℹ️  Azure Monitor configured but no default workspace found" -ForegroundColor Cyan
+      Save-Json "25_azure_monitor_sample.json" @{
+        status="no_workspace_configured"
+        message="Azure Monitor datasource exists but no Log Analytics workspace configured"
+      }
+    }
+  } else {
+    Write-Host "⚠️  Azure Monitor datasource health check failed" -ForegroundColor Yellow
+    Save-Json "25_azure_monitor_sample.json" @{
+      status="health_failed"
+      message="Azure Monitor datasource health check failed"
+      healthResponse=$azureHealth
     }
   }
-  
-  if (-not $azureSuccess) {
-    Write-Host "⚠️  Azure Monitor query failed - may require workspace configuration" -ForegroundColor Yellow
-    Save-Json "25_azure_monitor_sample.json" @{status="error";message="Azure Monitor query failed"}
-  }
+} else {
+  Write-Host "ℹ️  No Azure Monitor datasource found" -ForegroundColor Cyan
 }
 
 # 17. Plugin Analysis
@@ -534,7 +616,7 @@ if ($plugins) {
 }
 
 # 18. Configuration Validation
-Write-Host "Validating configuration..."
+Write-Host "🔍 Validating configuration..."
 
 $configValidation = @{
   datasourceConnectivity = @()
@@ -610,15 +692,25 @@ if ($promAlerts) {
   Save-Json "28_alert_severity_breakdown.json" $alertBreakdown
 }
 
-Write-Host "`n--- Completed enhanced audit. Output folder: $OutDir ---"
-Write-Host "Files generated: $(Get-ChildItem $OutDir -Filter '*.json' | Measure-Object | Select-Object -ExpandProperty Count)"
-Write-Host "Summary highlights:"
-Write-Host "  - Grafana version: $($summary.grafanaVersion) $(if($summary.hasUpdate) { "(Update available: $($summary.latestVersion))" } else { "(Up to date)" })"
-Write-Host "  - Datasources: $($summary.datasourceCount)"
-Write-Host "  - Dashboards: $($summary.dashboardCount)"
-Write-Host "  - Active alerts: $($summary.firingAlertsCount)/$($summary.promAlertsCount)"
-Write-Host "  - Plugins: $($summary.pluginCount)"
+Write-Host "`n🎉 --- Completed enhanced audit. Output folder: $OutDir ---" -ForegroundColor Green
+Write-Host "📁 Files generated: $(Get-ChildItem $OutDir -Filter '*.json' | Measure-Object | Select-Object -ExpandProperty Count)"
+Write-Host "`n📋 Summary highlights:" -ForegroundColor Cyan
+Write-Host "  🔧 Grafana version: $($summary.grafanaVersion) $(if($summary.hasUpdate) { "⚠️ (Update available: $($summary.latestVersion))" } else { "✅ (Up to date)" })"
+Write-Host "  🔌 Datasources: $($summary.datasourceCount)"
+Write-Host "  📊 Dashboards: $($summary.dashboardCount)"
+Write-Host "  🚨 Active alerts: $($summary.firingAlertsCount)/$($summary.promAlertsCount)"
+Write-Host "  🔌 Plugins: $($summary.pluginCount)"
 
 if ($alertBreakdown) {
-  Write-Host "  - Alert breakdown: Critical($($alertBreakdown.critical)) Warning($($alertBreakdown.warning)) Info($($alertBreakdown.info))"
+  Write-Host "  📈 Alert breakdown: 🔴 Critical($($alertBreakdown.critical)) 🟡 Warning($($alertBreakdown.warning)) ℹ️ Info($($alertBreakdown.info))"
 }
+
+# Additional summary based on audit flags
+Write-Host "`n🔍 Audit scope completed:" -ForegroundColor Cyan
+Write-Host "  $(if($summary.auditFlags.securityAudit) { "✅" } else { "❌" }) Security audit"
+Write-Host "  $(if($summary.auditFlags.performanceMetrics) { "✅" } else { "❌" }) Performance metrics"  
+Write-Host "  $(if($summary.auditFlags.userActivity) { "✅" } else { "❌" }) User activity analysis"
+Write-Host "  $(if($summary.auditFlags.dashboardExport) { "✅" } else { "❌" }) Dashboard exports"
+Write-Host "  $(if($summary.auditFlags.alertValidation) { "✅" } else { "❌" }) Alert validation"
+
+Write-Host "`n📄 View the detailed report: $(Join-Path $OutDir 'AUDIT_REPORT.md')" -ForegroundColor Magenta
