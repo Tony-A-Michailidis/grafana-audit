@@ -24,11 +24,11 @@
 
 # Full enterprise audit
 .\grafana-audit.ps1 -Base $url -Token $token -IncludeSecurityAudit -IncludePerformanceMetrics -IncludeUserActivity -ExportDashboards -ValidateAlerts
-  #>
+#>
 
 param(
-  [string]$Base = ".....", #<the base url where grafana lives>
-  [string]$Token = $env:GRAFANA_TOKEN, 
+  [string]$Base = "....", 
+  [string]$Token = $env:GRAFANA_TOKEN,  
   [string]$OutDir = "grafana-audit",
   [string]$PromUID = "promds",
   [string]$LokiUID = "lokids",
@@ -46,18 +46,7 @@ if (-not $Token) {
   exit 1
 }
 
-Write-Host "Using Grafana base: $Base"
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$Headers = @{ Authorization = "Bearer $Token" }
-
-# Test connectivity first
-Write-Host "Testing Grafana connectivity..."
-if (-not (Test-GrafanaConnectivity -BaseUrl $Base -Headers $Headers)) {
-  Write-Error "Failed to connect to Grafana. Please check URL and token."
-  exit 1
-}
-Write-Host "✅ Grafana connectivity confirmed"
-
+# Define all functions first
 function Save-Json {
   param(
     [string]$Name,
@@ -75,14 +64,21 @@ function Save-Json {
 function Invoke-GrafanaGet {
   param(
     [string]$Path,
-    [switch]$Raw
+    [switch]$Raw,
+    [switch]$SuppressWarnings
   )
   $url = "$Base$Path"
   try {
     $r = Invoke-RestMethod -Uri $url -Headers $Headers -Method Get -ErrorAction Stop
     if ($Raw) { return $r } else { return $r }
   } catch {
-    Write-Warning "GET $Path failed: $($_.Exception.Message)"
+    if (-not $SuppressWarnings) {
+      $statusCode = ""
+      if ($_.Exception.Response) {
+        $statusCode = " ($($_.Exception.Response.StatusCode))"
+      }
+      Write-Warning "GET $Path failed: $($_.Exception.Message)$statusCode"
+    }
     return $null
   }
 }
@@ -174,6 +170,38 @@ $(if($Summary.auditFlags.alertValidation) { "✅ Alert Validation" } else { "❌
   Write-Host "Audit report saved: $reportPath"
 }
 
+function Invoke-GrafanaGetWithFallback {
+  param(
+    [string]$Path,
+    [string]$Description,
+    [switch]$IsAdminRequired,
+    [switch]$IsOptional
+  )
+  
+  $result = Invoke-GrafanaGet -Path $Path -SuppressWarnings:$IsOptional
+  
+  if (-not $result -and $IsAdminRequired) {
+    Write-Host "⚠️  Skipping $Description (requires admin privileges)" -ForegroundColor Yellow
+  } elseif (-not $result -and -not $IsOptional) {
+    Write-Warning "$Description failed - this may indicate a configuration issue"
+  }
+  
+  return $result
+}
+
+# Initialize
+Write-Host "Using Grafana base: $Base"
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+$Headers = @{ Authorization = "Bearer $Token" }
+
+# Test connectivity first
+Write-Host "Testing Grafana connectivity..."
+if (-not (Test-GrafanaConnectivity -BaseUrl $Base -Headers $Headers)) {
+  Write-Error "Failed to connect to Grafana. Please check URL and token."
+  exit 1
+}
+Write-Host "✅ Grafana connectivity confirmed"
+
 # 1. Health & version
 $health   = Invoke-GrafanaGet "/api/health"
 $frontend = Invoke-GrafanaGet "/api/frontend/settings"
@@ -262,28 +290,38 @@ Save-Json "10_prometheus_load_snapshot.json" $loadResults
 # 9. Loki sampling (auto-fallback paths)
 $lokiOk = $false
 if ($LokiUID) {
+  Write-Host "Testing Loki connectivity..."
   $now = [int][double]::Parse((Get-Date -UFormat %s))
   $start = $now - 300
   $logQuery = '{level="error"}'
   $enc = [System.Uri]::EscapeDataString($logQuery)
 
+  # Try different Loki API paths
   $candidatePaths = @(
     "/api/datasources/uid/$LokiUID/proxy/loki/api/v1/query_range?query=$enc&start=${start}000000000&end=${now}000000000&limit=50",
-    "/api/datasources/proxy/$($datasources | Where-Object {$_.type -eq 'loki'} | Select-Object -First 1 -ExpandProperty id)/loki/api/v1/query_range?query=$enc&start=${start}000000000&end=${now}000000000&limit=50",
-    "/api/datasources/uid/$LokiUID/resources/loki/api/v1/query_range?query=$enc&start=${start}000000000&end=${now}000000000&limit=50" # last (legacy attempt)
+    "/api/datasources/uid/$LokiUID/resources/loki/api/v1/query_range?query=$enc&start=${start}000000000&end=${now}000000000&limit=50"
   )
+  
+  # Add proxy by ID if we can find the Loki datasource
+  $lokiDS = $datasources | Where-Object {$_.type -eq 'loki'} | Select-Object -First 1
+  if ($lokiDS) {
+    $candidatePaths += "/api/datasources/proxy/$($lokiDS.id)/loki/api/v1/query_range?query=$enc&start=${start}000000000&end=${now}000000000&limit=50"
+  }
 
   foreach ($p in $candidatePaths) {
-    $resp = Invoke-GrafanaGet $p
+    $resp = Invoke-GrafanaGet $p -SuppressWarnings
     if ($resp) {
       Save-Json "11_loki_error_sample.json" $resp
       $lokiOk = $true
+      Write-Host "✅ Loki connection successful"
       break
     }
   }
 
   if (-not $lokiOk) {
-    Write-Warning "All Loki proxy path attempts failed (checked proxy & resources styles)."
+    Write-Host "⚠️  Loki sampling failed - may indicate connectivity issues" -ForegroundColor Yellow
+    # Create empty result to maintain file structure
+    Save-Json "11_loki_error_sample.json" @{status="error";message="Loki connection failed"}
   }
 } else {
   Write-Host "No Loki UID provided; skipping Loki sample."
@@ -293,10 +331,10 @@ if ($LokiUID) {
 if ($IncludeSecurityAudit) {
   Write-Host "Performing security audit..."
   
-  # User and team information
-  $users = Invoke-GrafanaGet "/api/users/search"
+  # User and team information (requires admin privileges)
+  $users = Invoke-GrafanaGetWithFallback "/api/users/search" "User audit" -IsAdminRequired
   $teams = Invoke-GrafanaGet "/api/teams/search"
-  $orgs = Invoke-GrafanaGet "/api/orgs"
+  $orgs = Invoke-GrafanaGetWithFallback "/api/orgs" "Organization audit" -IsAdminRequired
   
   if ($users) { Save-Json "12_users_audit.json" $users }
   if ($teams) { Save-Json "13_teams_audit.json" $teams }
@@ -306,8 +344,8 @@ if ($IncludeSecurityAudit) {
   $serviceAccounts = Invoke-GrafanaGet "/api/serviceaccounts/search"
   if ($serviceAccounts) { Save-Json "15_service_accounts.json" $serviceAccounts }
   
-  # Authentication settings
-  $authSettings = Invoke-GrafanaGet "/api/admin/settings"
+  # Authentication settings (requires admin privileges)
+  $authSettings = Invoke-GrafanaGetWithFallback "/api/admin/settings" "Authentication settings" -IsAdminRequired
   if ($authSettings) { 
     # Redact sensitive auth info
     if ($authSettings.auth) {
@@ -407,9 +445,18 @@ if ($ValidateAlerts) {
   $notificationPolicies = Invoke-GrafanaGet "/api/alertmanager/grafana/config/api/v1/receivers"
   if ($notificationPolicies) { Save-Json "22_notification_policies.json" $notificationPolicies }
   
-  # Test notification channels
-  $contactPoints = Invoke-GrafanaGet "/api/alertmanager/grafana/config/api/v1/alerts/groups"
-  if ($contactPoints) { Save-Json "23_alert_groups.json" $contactPoints }
+  # Test alert groups - try different endpoints
+  $alertGroups = Invoke-GrafanaGet "/api/alertmanager/grafana/api/v1/alerts/groups" -SuppressWarnings
+  if (-not $alertGroups) {
+    $alertGroups = Invoke-GrafanaGet "/api/alertmanager/grafana/api/v2/alerts/groups" -SuppressWarnings
+  }
+  
+  if ($alertGroups) { 
+    Save-Json "23_alert_groups.json" $alertGroups 
+  } else {
+    Write-Host "⚠️  Alert groups endpoint not available" -ForegroundColor Yellow
+    Save-Json "23_alert_groups.json" @{status="not_available";message="Alert groups endpoint not found"}
+  }
 }
 
 # 15. Infrastructure Health Check
@@ -442,13 +489,31 @@ Save-Json "24_infrastructure_health.json" $infraResults
 if ($AzureMonitorUID -and ($datasources | Where-Object {$_.uid -eq $AzureMonitorUID})) {
   Write-Host "Checking Azure Monitor integration..."
   
-  # Test Azure Monitor connectivity
-  $azureQuery = "Heartbeat | summarize count() by bin(TimeGenerated, 1h) | order by TimeGenerated desc | limit 24"
+  # Test Azure Monitor connectivity with a simpler query
+  $azureQuery = "Heartbeat | limit 1"
   $encodedQuery = [System.Uri]::EscapeDataString($azureQuery)
-  $azureResp = Invoke-GrafanaGet "/api/datasources/uid/$AzureMonitorUID/resources/azuremonitor/subscriptions/query?query=$encodedQuery"
   
-  if ($azureResp) {
-    Save-Json "25_azure_monitor_sample.json" $azureResp
+  # Try different Azure Monitor API paths
+  $azurePaths = @(
+    "/api/datasources/uid/$AzureMonitorUID/resources/azuremonitor/query?query=$encodedQuery",
+    "/api/datasources/uid/$AzureMonitorUID/resources/logs?query=$encodedQuery",
+    "/api/datasources/uid/$AzureMonitorUID/proxy/v1/workspaces/query?query=$encodedQuery"
+  )
+  
+  $azureSuccess = $false
+  foreach ($path in $azurePaths) {
+    $azureResp = Invoke-GrafanaGet $path -SuppressWarnings
+    if ($azureResp) {
+      Save-Json "25_azure_monitor_sample.json" $azureResp
+      $azureSuccess = $true
+      Write-Host "✅ Azure Monitor connection successful"
+      break
+    }
+  }
+  
+  if (-not $azureSuccess) {
+    Write-Host "⚠️  Azure Monitor query failed - may require workspace configuration" -ForegroundColor Yellow
+    Save-Json "25_azure_monitor_sample.json" @{status="error";message="Azure Monitor query failed"}
   }
 }
 
